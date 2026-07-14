@@ -36,6 +36,7 @@ def load_checkpoint_meta(ckpt_dir, tag="last"):
 def train_one_epoch(model, loader, optimizer, criterions, device, log_every=20):
     model.train()
     running = 0.0
+    running_parts = {"box": 0.0, "obj": 0.0, "noobj": 0.0, "cls": 0.0}
     for i, (imgs, targets) in enumerate(loader):
         imgs = imgs.to(device)
         targets = [t.to(device) for t in targets]
@@ -43,8 +44,10 @@ def train_one_epoch(model, loader, optimizer, criterions, device, log_every=20):
         preds = model(imgs)  # (out_large, out_medium, out_small)
         loss = 0.0
         for scale_idx, pred in enumerate(preds):
-            l, _ = criterions[scale_idx](pred, targets, scale_idx)
+            l, parts = criterions[scale_idx](pred, targets, scale_idx)
             loss = loss + l
+            for k in running_parts:
+                running_parts[k] += parts[k]
 
         optimizer.zero_grad()
         loss.backward()
@@ -53,7 +56,9 @@ def train_one_epoch(model, loader, optimizer, criterions, device, log_every=20):
         running += loss.item()
         if i % log_every == 0:
             print(f"  step {i}/{len(loader)}  loss {loss.item():.4f}")
-    return running / max(len(loader), 1)
+    n = max(len(loader), 1)
+    avg_parts = {k: v / n for k, v in running_parts.items()}
+    return running / n, avg_parts
 
 
 def fit(model, loader, device, epochs, lr, ckpt_dir, num_classes, resume=True):
@@ -76,10 +81,12 @@ def fit(model, loader, device, epochs, lr, ckpt_dir, num_classes, resume=True):
     history = []
     for epoch in range(start_epoch, epochs):
         t0 = time.time()
-        avg_loss = train_one_epoch(model, loader, optimizer, criterions, device)
+        avg_loss, avg_parts = train_one_epoch(model, loader, optimizer, criterions, device)
         dt = time.time() - t0
-        print(f"epoch {epoch}: avg_loss={avg_loss:.4f}  ({dt:.1f}s)")
-        history.append({"epoch": epoch, "loss": avg_loss, "seconds": dt})
+        print(f"epoch {epoch}: avg_loss={avg_loss:.4f}  "
+              f"(box={avg_parts['box']:.3f} obj={avg_parts['obj']:.3f} "
+              f"noobj={avg_parts['noobj']:.3f} cls={avg_parts['cls']:.3f})  ({dt:.1f}s)")
+        history.append({"epoch": epoch, "loss": avg_loss, "seconds": dt, **avg_parts})
 
         save_checkpoint(model, optimizer, epoch, len(loader), min(best_loss, avg_loss), ckpt_dir, tag="last")
         if avg_loss < best_loss:
