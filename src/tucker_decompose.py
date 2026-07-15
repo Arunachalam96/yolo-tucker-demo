@@ -322,3 +322,32 @@ def phase2_compress(model, layers, sensitivities, sweep_data, global_target,
     print(f"\nTotal compressible params: {total_before:,} -> {total_after:,} "
           f"({total_after/total_before:.1%} kept)")
     return model, done
+@torch.no_grad()
+def recalibrate_batchnorm(model, loader, device, num_batches=20):
+    """
+    Tucker-2 factorization changes the activation statistics flowing into
+    every BatchNorm2d that follows a compressed conv, but each BN layer's
+    running mean/variance is still calibrated for the *original* conv's
+    output distribution. This mismatch is a common source of erratic
+    post-compression predictions (confidence/objectness scores swinging
+    unpredictably across images) even when the underlying weights are a
+    good low-rank approximation.
+
+    This recomputes running stats via a handful of forward-only passes
+    (train() mode so BN updates its running stats, no_grad so nothing else
+    changes) -- no gradient step, no weight update, just re-syncing BN to
+    what the factored layers actually produce now.
+    """
+    model.train()
+    for m in model.modules():
+        if isinstance(m, nn.BatchNorm2d):
+            m.reset_running_stats()
+            m.momentum = None  # use cumulative moving average over all batches seen
+
+    for i, (imgs, _) in enumerate(loader):
+        if i >= num_batches:
+            break
+        model(imgs.to(device))
+
+    model.eval()
+    return model
