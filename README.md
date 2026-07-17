@@ -1,90 +1,97 @@
-# YOLOv3 + Tucker-2 Compression — Demo Pipeline
+# YOLOv3 + Tucker Compression — Demo Pipeline
 
-From-scratch PyTorch YOLOv3, trained on a COCO subset, compressed with your
-Phase 1 / Phase 2 Tucker-2 methodology, all in notebooks structured for a
-live demo: the slow part (training) is pre-run beforehand, the fast part
-(decomposition) runs live in a few minutes.
+From-scratch PyTorch YOLOv3, trained on a COCO subset, compressed with the
+**same Tucker methodology as the validated CNN/ViT pipeline** (VGG/ResNet/
+MobileNet), structured for a live demo: the slow stages (training, Phase 1
+sweep) are pre-run and stored; the fast stage (Phase 2 selection) runs live.
+
+## Methodology (matches the CNN pipeline)
+
+- **Decomposition**: full Tucker on the (C_out, C_in, kH, kW) weight, full
+  spatial ranks, spatial factors folded back into the core via mode_dot,
+  deployed as 1x1 -> kxk -> 1x1 conv sequence (TuckerBlock).
+- **Phase 1** (per layer, offline): sweep a 2D (r_in, r_out) grid at
+  step = 20% of min(C_in, C_out). Per combo, measure noise % (std-based
+  activation-error metric via forward hooks) and mAP@0.5 (object-detection
+  analog of top-1 accuracy). Fit a symmetrized degree-4 (biquadratic)
+  polynomial of mAP vs noise.
+- **Phase 2** (per layer, live): invert the polynomial for max tolerable
+  noise under a global mAP budget (as a percentage of baseline), Pareto front
+  over (compression ratio, mAP), K-means cluster into Conservative / Balanced
+  / Aggressive suggestions.
+- **BatchNorm recalibration** after compression: forward-only resync of BN
+  running stats (no weight/gradient updates).
+
+The only substitution vs. the CNN pipeline is mAP@0.5 in place of top-1
+accuracy on the polynomial's y-axis. Noise metric, sweep, fit, Pareto, and
+clustering are identical.
 
 ## Structure
 
-```
-src/                        shared modules, imported by all notebooks
-  model.py                  Darknet-53 backbone + YOLOv3 3-scale head
-  loss.py                   objectness/box(CIoU)/class loss, anchor matching
-  dataset.py                COCO-subset Dataset, letterbox + augmentation
-  train_utils.py            training loop + JSON checkpoint crash-recovery
-  tucker_decompose.py       Phase 1 (sensitivity) + Phase 2 (budget/compress)
-  postprocess.py            box decode, NMS, simple mAP@0.5
-  analysis_utils.py         param count, model size, latency
+    src/
+      model.py            Darknet-53 backbone + YOLOv3 3-scale head
+      loss.py             objectness/box(CIoU)/class loss, anchor matching
+      dataset.py          COCO-subset Dataset, letterbox + augmentation
+      train_utils.py      training loop + JSON checkpoint crash-recovery
+      postprocess.py      box decode, NMS, simple mAP@0.5
+      tucker_pipeline.py  TuckerBlock, decomposition, noise metric,
+                          biquadratic fit, Phase-2 (invert/Pareto/KMeans),
+                          BN recalibration
+      tucker_phase1.py    Phase-1 sweep + subsampled mAP evaluator
+      analysis_utils.py   param count, model size, latency
 
-notebooks/
-  01_data_loading.ipynb        build the COCO subset, visualize a batch
-  02_model_definition.ipynb    build model, shape/param sanity checks
-  03_training.ipynb            ⏱️ SLOW — run ahead of the demo
-  04_decomposition.ipynb       ⚡ FAST — run live during the demo
-  05_analysis.ipynb            before/after: params, size, latency, mAP
-```
+    notebooks/
+      01_data_loading.ipynb       build the COCO subset, visualize a batch
+      02_model_definition.ipynb   build model, shape/param sanity checks
+      03_training.ipynb           SLOW  — train the baseline, pre-run
+      04_phase1_sweep.ipynb       SLOW  — offline sweep, per-layer JSON ckpts
+      05_phase2_selection.ipynb   FAST  — live: select, apply, recalibrate, save
+      06_analysis.ipynb           before/after: params, size, latency, mAP
 
 ## Demo-day workflow
 
-1. **Before the demo:** run `01`, `02`, `03` in full (03 is the long one —
-   leave it running, it checkpoints every epoch and resumes if interrupted).
-   This produces `checkpoints/yolov3_best.pt`.
-2. **Live, in front of the audience:** run `04_decomposition.ipynb`. Phase 1's
-   sensitivity sweep is scoped down (`MAX_BATCHES`, 5 ratios/layer) to finish
-   in a couple of minutes; Phase 2 is near-instant. Everyone watches the
-   actual compression happen.
-3. **Also live (or pre-run, your call):** `05_analysis.ipynb` — params/size/
-   latency/mAP comparison and the per-layer compression bar chart.
+Pre-run offline (DGX), ahead of the demo:
+1. 01, 02, 03 — data, model, train baseline (yolov3_best.pt).
+2. 04_phase1_sweep — 2D sweep across all 37 compressible layers. Heavy;
+   checkpoints per layer to checkpoints/phase1/ and resumes if interrupted.
+   Carry that folder to the demo machine.
+
+Live:
+3. 05_phase2_selection — loads stored Phase 1 JSON, runs invert -> Pareto ->
+   K-means (near-instant), pick a tier, applies decomposition + BN
+   recalibration, saves yolov3_compressed.pt.
+4. 06_analysis — before/after (can also be pre-run).
 
 ## Setup
 
-```
-pip install torch tensorly pycocotools opencv-python-headless matplotlib pandas jupyter
-```
+    pip install torch tensorly pycocotools opencv-python-headless \
+                scipy scikit-learn matplotlib pandas jupyter ipykernel
 
-Point `DATA_ROOT` in `01_data_loading.ipynb` at a COCO 2017 layout:
-```
-DATA_ROOT/annotations/instances_train2017.json
-DATA_ROOT/annotations/instances_val2017.json
-DATA_ROOT/train2017/*.jpg
-DATA_ROOT/val2017/*.jpg
-```
-Download from https://cocodataset.org/#download. `CLASS_NAMES` in the same
-notebook picks a small subset (default: person/car/dog/chair/bottle) so
-training finishes in a reasonable time on one GPU — bump `images_per_class`
-or add classes once you've confirmed timing on your machine.
+Point DATA_ROOT in 01_data_loading.ipynb at a COCO 2017 layout (annotations
++ train2017/ + val2017/). CLASS_NAMES picks a small subset.
 
-## Design notes / things you'll likely want to tune
+## Notes / things to tune
 
-- **Compressible-layer selection** (`get_compressible_conv_layers`) skips the
-  stem conv and the three detection-head prediction convs, matching your
-  existing "skip first conv / skip classification head" convention.
-- **Sensitivity metric** is the same `2*|a2|` biquadratic-curvature approach
-  as the CNN/ViT pipeline, computed per-layer via an in-place swap-evaluate-
-  restore (no full-model deepcopy — this is what keeps Phase 1 fast even
-  though YOLOv3 has ~70 compressible conv layers).
-- **Budget distribution** in Phase 2 mirrors your normalization + floor
-  (`global_budget/(3*n_layers)`) + cap (`3x global_target`) guardrails, plus
-  one addition worth flagging: a **no-benefit guardrail** that skips
-  compressing very thin layers where the 1x1-reduce/expand overhead would
-  make the factored layer *larger* than the original (this showed up during
-  testing — small early Darknet layers are the main ones affected).
-- **Crash recovery**: both `03_training` (epoch-level) and `04_decomposition`
-  (layer-level, via `phase2_state.json`) resume automatically if interrupted.
-- **mAP@0.5** in `05_analysis` is a lightweight from-scratch implementation
-  (not COCOeval) — enough for a relative before/after comparison, not a
-  paper-grade benchmark. Swap in `pycocotools.cocoeval` if you need the
-  latter.
-- **Latency vs. param-count**: Tucker-2's extra sequential 1x1/kxk/1x1 ops
-  mean wall-clock speedup doesn't always track parameter reduction 1:1,
-  especially on GPU. `05_analysis` reports both so you're not caught off
-  guard live if someone asks why a 50%-smaller model isn't 2x faster.
+- 37 compressible layers (of 75 Conv2d): all 3x3 convs except the stem; 1x1
+  convs and the 3 prediction heads are skipped. These 37 hold ~91% of the
+  network's parameters. 28 are in the Darknet-53 backbone, 9 in neck/heads.
+- 1x1 convs are skipped by the kernel>1x1 rule (matching the CNN pipeline).
+  Tucker on a 1x1 conv reduces to truncated SVD — the same path as the
+  ViT/LLM Linear-layer work, if you ever want to include them.
+- DataLoader num_workers=0 everywhere, to avoid Docker shared-memory bus
+  errors. Raise only if the container is started with --shm-size=8g.
+- Budget is a percentage of baseline mAP (e.g. 5.0 = allow the fitted curve
+  to drop to 95% of baseline). Baseline measured once up front.
+- Phase-1 MAP_MAX_BATCHES controls the mAP-eval subsample size — larger =
+  more trustworthy curves (fine, since Phase 1 is offline).
+- Latency vs param count: Tucker adds sequential 1x1/kxk/1x1 ops, so
+  wall-clock speedup doesn't track parameter reduction — the win is model
+  size / memory. 06_analysis reports both.
 
-## Extending toward your LLM work
+## Extending toward LLMs
 
-`tucker_decompose.py` is architecture-agnostic — it factors any `Conv2d`,
-which per your Tucker-2=SVD-on-2D-weights insight is directly the LLM
-extension for attention/FFN Linear layers, just swap `Conv2d` enumeration
-for `Linear` and use `perplexity` as the phase-1 evaluation signal in place
-of `eval_loss`.
+tucker_pipeline.py is architecture-agnostic on the decomposition side. For
+LLMs, swap Conv2d enumeration for Linear, use the SVD path (a Linear / 1x1
+layer has no spatial mode to fold), and use perplexity as the smooth Phase-1
+quality metric in place of mAP — same symmetrized-fit + invert + Pareto
+machinery.
