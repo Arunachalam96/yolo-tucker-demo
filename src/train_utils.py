@@ -61,9 +61,34 @@ def train_one_epoch(model, loader, optimizer, criterions, device, log_every=20):
     return running / n, avg_parts
 
 
-def fit(model, loader, device, epochs, lr, ckpt_dir, num_classes, resume=True):
+def make_lr_lambda(warmup_epochs, total_epochs, min_lr_frac=0.01):
+    """
+    Linear warmup for `warmup_epochs`, then cosine decay down to
+    min_lr_frac * base_lr by `total_epochs`. Returns a function of epoch
+    suitable for torch.optim.lr_scheduler.LambdaLR.
+    """
+    import math
+
+    def lr_lambda(epoch):
+        if epoch < warmup_epochs:
+            return (epoch + 1) / max(1, warmup_epochs)
+        progress = (epoch - warmup_epochs) / max(1, total_epochs - warmup_epochs)
+        progress = min(1.0, progress)
+        cosine = 0.5 * (1 + math.cos(math.pi * progress))
+        return min_lr_frac + (1 - min_lr_frac) * cosine
+
+    return lr_lambda
+
+
+def fit(model, loader, device, epochs, lr, ckpt_dir, num_classes, resume=True,
+        warmup_epochs=3, use_schedule=True):
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     criterions = [YOLOLoss(num_classes) for _ in range(3)]
+
+    scheduler = None
+    if use_schedule:
+        scheduler = torch.optim.lr_scheduler.LambdaLR(
+            optimizer, lr_lambda=make_lr_lambda(warmup_epochs, epochs))
 
     start_epoch = 0
     best_loss = float("inf")
@@ -78,15 +103,24 @@ def fit(model, loader, device, epochs, lr, ckpt_dir, num_classes, resume=True):
             best_loss = meta["best_loss"]
             print(f"Resumed from epoch {start_epoch} (best_loss={best_loss:.4f})")
 
+    # advance scheduler to the resumed epoch so the LR curve stays consistent
+    if scheduler is not None:
+        for _ in range(start_epoch):
+            scheduler.step()
+
     history = []
     for epoch in range(start_epoch, epochs):
         t0 = time.time()
+        cur_lr = optimizer.param_groups[0]["lr"]
         avg_loss, avg_parts = train_one_epoch(model, loader, optimizer, criterions, device)
         dt = time.time() - t0
-        print(f"epoch {epoch}: avg_loss={avg_loss:.4f}  "
+        print(f"epoch {epoch}: avg_loss={avg_loss:.4f}  lr={cur_lr:.2e}  "
               f"(box={avg_parts['box']:.3f} obj={avg_parts['obj']:.3f} "
               f"noobj={avg_parts['noobj']:.3f} cls={avg_parts['cls']:.3f})  ({dt:.1f}s)")
-        history.append({"epoch": epoch, "loss": avg_loss, "seconds": dt, **avg_parts})
+        history.append({"epoch": epoch, "loss": avg_loss, "lr": cur_lr, "seconds": dt, **avg_parts})
+
+        if scheduler is not None:
+            scheduler.step()
 
         save_checkpoint(model, optimizer, epoch, len(loader), min(best_loss, avg_loss), ckpt_dir, tag="last")
         if avg_loss < best_loss:
