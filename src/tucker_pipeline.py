@@ -368,3 +368,50 @@ def apply_selected_ranks(model, selections, device):
         set_module_by_name(model, name, block)
     model.to(device)
     return model
+
+
+# ---------------------------------------------------------------------------
+# Optional fine-tuning of the compressed model (whole-model, low LR)
+# ---------------------------------------------------------------------------
+
+def finetune_compressed(model, loader, device, epochs, num_classes,
+                        lr=1e-4, ckpt_dir="../checkpoints/finetune",
+                        warmup_epochs=1, resume=True):
+    """
+    Fine-tune an already-compressed (and BN-recalibrated) model at a LOW
+    learning rate so the decomposed weights adapt to the compression without
+    destroying the low-rank initialization.
+
+    Whole-model: every weight updates, but the small LR keeps the already-good
+    layers from drifting. Reuses the same YOLO loss + training loop as baseline
+    training. Checkpoints to its OWN directory (not the baseline's) so nothing
+    collides, and resumes if interrupted -- so this can be pre-run offline and
+    the result loaded live.
+
+    epochs=0 is a no-op (returns the model unchanged) -- lets the caller keep
+    recalibration-only behavior by leaving the knob at 0.
+
+    Returns the fine-tuned model.
+    """
+    import os
+    import torch
+    from train_utils import fit
+
+    if epochs <= 0:
+        print("finetune: epochs=0 -> skipping (recalibration-only)")
+        return model
+
+    os.makedirs(ckpt_dir, exist_ok=True)
+    print(f"finetune: {epochs} epochs @ lr={lr:.1e} (whole-model, low LR)")
+
+    # Reuse the baseline training loop. A gentle warmup + cosine decay over the
+    # (few) fine-tune epochs; the low base LR is the key safety knob. `fit`
+    # checkpoints to ckpt_dir/yolov3_{last,best}.pt and resumes from there --
+    # since ckpt_dir is the finetune dir, the compressed model passed in is the
+    # starting point on a fresh run, or the in-progress fine-tune on resume.
+    fit(model, loader, device, epochs=epochs, lr=lr, ckpt_dir=ckpt_dir,
+        num_classes=num_classes, resume=resume,
+        warmup_epochs=min(warmup_epochs, max(1, epochs // 3)), use_schedule=True)
+
+    model.eval()
+    return model
